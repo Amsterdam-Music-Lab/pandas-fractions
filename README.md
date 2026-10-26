@@ -221,7 +221,63 @@ all `True` for `!=`, and raise a `TypeError` for ordering comparisons, consisten
 and `+x` returns a copy.
 Missing values stay missing, since their denominator remains 0.
 
+## Reductions
+
+Reductions like `s.sum()` or `df.mean()` are implemented in `_reduce`,
+the interface pandas uses for all reductions of extension arrays.
+`_reduce` computes a scalar in `_reduce_scalar`,
+and wraps it in an array of length 1 if pandas asks for `keepdims=True`
+(which it does for `DataFrame` reductions, so that the result column keeps the `frac` dtype).
+
+### Result types
+
+Reductions whose result is always rational return an exact `Fraction`:
+`sum`, `prod`, `min`, `max`, `mean`, `median`, and `var`.
+`std` and `sem` involve a square root, so they return a `float`, computed from the exact variance.
+`any` and `all` return a `bool`.
+`skew` and `kurt` are not supported and raise a `TypeError`.
+
+### Missing values and empty inputs
+
+- With `skipna=True` (the default), missing values are ignored.
+- With `skipna=False`, any missing value makes the result missing
+  (`NaN` for the float-valued `std` and `sem`).
+- If no values are left, `sum` and `prod` return their neutral elements `0` and `1`,
+  and all other reductions return a missing value.
+  `min_count` works as for other dtypes: `sum` and `prod` return a missing value
+  if fewer than `min_count` values are present.
+- `var`, `std`, and `sem` are missing if there are no more values than `ddof` (default 1).
+- `any` and `all` treat missing values like `NaN`:
+  they are skipped with `skipna=True` and count as true (nonzero) otherwise.
+
+### Vectorized tree reduction
+
+`sum`, `prod`, `min`, and `max` reuse the binary operations on parts (`_add`, `_mul`, `_min`, `_max`)
+in `_tree_reduce`:
+it combines the first half of the array with the second half elementwise,
+and repeats this until a single value is left.
+This needs only about log₂(n) vectorized steps instead of n Python-level steps.
+If the remaining length is odd, the array is padded with the neutral element of the operation
+(`0/1` for `sum`, `1/1` for `prod`), or with a copy of the last element for `min` and `max`.
+
+Overflows are handled exactly like in arithmetic, since the same checked operations are used.
+Note that `sum` (and therefore `mean` and `var`) can overflow quite easily:
+the denominator of a sum is the least common multiple of all denominators,
+which exceeds `int64` for many unrelated denominators, even if the individual values are small.
+Values that share a common grid of denominators (like note durations or onsets) are no problem.
+`min` and `max` use the same exact comparison as the comparison operators,
+which falls back to Python integers instead of overflowing.
+
+### Other reductions
+
+- `mean` is the sum divided by the number of values.
+- `median` sorts the values as Python `Fraction`s, which is exact but not vectorized,
+  and averages the two middle values for an even number of values.
+- `var` computes the exact squared deviations from the exact mean,
+  sums them with the tree reduction, and divides by `n - ddof`.
+- `std` is the square root of `var` as a float, and `sem` is `std / sqrt(n)`.
+
 ## Not yet implemented
 
-- Reductions such as `sum`, `prod`, `min`, and `max` (via `_reduce`).
 - numpy ufuncs (via `__array_ufunc__`), e.g. `np.add(x, y)`.
+- Cumulative operations like `cumsum` (via `_accumulate`).

@@ -1,4 +1,5 @@
 import operator
+import statistics
 from fractions import Fraction as F
 
 import numpy as np
@@ -73,11 +74,11 @@ BINARY_OPS = [
 ]
 
 
-def random_fractions(rng, n, nonzero=False):
+def random_fractions(rng, n, nonzero=False, max_den=1000):
     num = rng.integers(-1000, 1000, n)
     if nonzero:
         num[num == 0] = 1
-    den = rng.integers(1, 1000, n)
+    den = rng.integers(1, max_den, n)
     return [F(int(a), int(b)) for a, b in zip(num, den)]
 
 
@@ -228,3 +229,92 @@ def test_cmp_large_values():
     y = FractionArray._from_sequence([F(big - 2, big - 1)])
     assert (x > y).tolist() == [True]
     assert (x == y).tolist() == [False]
+
+
+# reductions
+# ----------
+
+
+@pytest.mark.parametrize("name", ["sum", "min", "max", "mean", "median", "var"])
+def test_reduce_matches_python(name):
+    rng = np.random.default_rng(1)
+    for n in [1, 2, 7, 64]:
+        # small denominators keep the exact result within int64
+        xs = random_fractions(rng, n, max_den=13)
+        expected = {
+            "sum": lambda: sum(xs, F(0)),
+            "min": lambda: min(xs),
+            "max": lambda: max(xs),
+            "mean": lambda: statistics.mean(xs),
+            "median": lambda: statistics.median(xs),
+            "var": lambda: statistics.variance(xs) if n > 1 else None,
+        }[name]()
+        result = getattr(pd.Series(xs, dtype="frac"), name)()
+        if expected is None:
+            assert pd.isna(result)
+        else:
+            assert result == expected
+            assert isinstance(result, F)
+
+
+def test_reduce_prod():
+    xs = [F(1, 2), F(-2, 3), F(9, 4), F(5)]
+    assert pd.Series(xs, dtype="frac").prod() == F(-15, 4)
+
+
+def test_reduce_float_results(s):
+    # s without NA: 1/2, 3, 1/3, 1/4
+    var = float(s.var())
+    assert s.std() == pytest.approx(var**0.5)
+    assert s.sem() == pytest.approx((var / 4) ** 0.5)
+    assert s.var(ddof=0) == statistics.pvariance([F(1, 2), F(3), F(1, 3), F(1, 4)])
+
+
+def test_reduce_na(s):
+    assert s.sum() == F(49, 12)
+    assert pd.isna(s.sum(skipna=False))
+    assert pd.isna(s.max(skipna=False))
+    assert np.isnan(s.std(skipna=False))
+    assert pd.isna(s.sum(min_count=5))
+    assert s.sum(min_count=4) == F(49, 12)
+
+
+def test_reduce_empty():
+    empty = pd.Series([], dtype="frac")
+    assert empty.sum() == 0
+    assert empty.prod() == 1
+    for name in ["min", "max", "mean", "median", "var"]:
+        assert pd.isna(getattr(empty, name)())
+    assert np.isnan(empty.std())
+
+
+def test_reduce_any_all():
+    s = pd.Series([F(0), F(1, 2), None], dtype="frac")
+    assert s.any()
+    assert not s.all()
+    assert not pd.Series([F(0), None], dtype="frac").any()
+    assert pd.Series([F(1), None], dtype="frac").all()
+    # unskipped NA is truthy, like NaN
+    assert pd.Series([F(0), None], dtype="frac").any(skipna=False)
+
+
+def test_reduce_overflow():
+    big = 2**62
+    with pytest.raises(OverflowError):
+        pd.Series([big, big], dtype="frac").sum()
+    # min and max compare exactly instead of overflowing
+    s = pd.Series([F(big - 1, big), F(big - 2, big - 1)], dtype="frac")
+    assert s.max() == F(big - 1, big)
+
+
+def test_reduce_unsupported(s):
+    with pytest.raises(TypeError):
+        s.skew()
+
+
+def test_dataframe_reductions(s):
+    df = pd.DataFrame({"a": s, "b": s * 2})
+    result = df.sum()
+    assert result.dtype == s.dtype
+    assert result.tolist() == [F(49, 12), F(49, 6)]
+    assert df.agg(["min", "max"])["b"].tolist() == [F(1, 2), F(6)]

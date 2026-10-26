@@ -112,6 +112,53 @@ def _mod(a, b, c, d):
     return _sub(a, b, *_mul(q, one, c, d))
 
 
+def _compare(op, a, b, c, d):
+    """Compare a/b with c/d elementwise. Requires positive denominators."""
+    # a/b < c/d iff a*d < c*b
+    try:
+        return op(_checked_mul(a, d), _checked_mul(c, b))
+    except OverflowError:
+        # compare exactly with Python ints
+        obj = lambda x: np.asarray(x).astype(object)
+        return np.asarray(op(obj(a) * obj(d), obj(c) * obj(b)), dtype=bool)
+
+
+def _min(a, b, c, d):
+    left = _compare(operator.le, a, b, c, d)
+    return np.where(left, a, c), np.where(left, b, d)
+
+
+def _max(a, b, c, d):
+    left = _compare(operator.ge, a, b, c, d)
+    return np.where(left, a, c), np.where(left, b, d)
+
+
+def _tree_reduce(f, num, den, neutral):
+    """
+    Reduce non-empty arrays of fractions with a binary operation on parts.
+
+    Combines the two halves of the arrays elementwise until one element is left,
+    so that each step is vectorized.
+    An odd element is padded with `neutral`, or with itself if `neutral` is None.
+    """
+    while len(num) > 1:
+        if len(num) % 2 == 1:
+            pad_num, pad_den = (num[-1], den[-1]) if neutral is None else neutral
+            num, den = np.append(num, pad_num), np.append(den, pad_den)
+        h = len(num) // 2
+        num, den = f(num[:h], den[:h], num[h:], den[h:])
+    return num, den
+
+
+# reduction: (binary operation, neutral element)
+_TREE_REDUCTIONS = {
+    "sum": (_add, (0, 1)),
+    "prod": (_mul, (1, 1)),
+    "min": (_min, None),
+    "max": (_max, None),
+}
+
+
 _ARITH_OPS = {
     operator.add: _add,
     operator.sub: _sub,
@@ -312,13 +359,7 @@ class FractionArray(OpsMixin, pd.api.extensions.ExtensionArray):
 
         a, b = self._num, self._den
         c, d = coerced
-        # denominators are positive, so a/b < c/d iff a*d < c*b
-        try:
-            result = op(_checked_mul(a, d), _checked_mul(c, b))
-        except OverflowError:
-            # compare exactly with Python ints
-            obj = lambda x: x.astype(object)
-            result = np.asarray(op(obj(a) * obj(d), obj(c) * obj(b)), dtype=bool)
+        result = _compare(op, a, b, c, d)
         # NA behaves like NaN: only != is true
         return np.where((b == 0) | (d == 0), op is operator.ne, result)
 
@@ -331,3 +372,80 @@ class FractionArray(OpsMixin, pd.api.extensions.ExtensionArray):
     def __abs__(self):
         _overflow_if(self._num == _INT_MIN)
         return type(self)(np.abs(self._num), self._den.copy())
+
+    # reductions
+    # ----------
+
+    def _reduce(self, name: str, *, skipna=True, keepdims=False, **kwargs):
+        result = self._reduce_scalar(name, skipna=skipna, **kwargs)
+        if not keepdims:
+            return result
+        if isinstance(result, (bool, np.bool_, float)):
+            return np.array([result])
+        return type(self)._from_sequence([result])
+
+    def _reduce_scalar(self, name, *, skipna, min_count=0, ddof=1, **kwargs):
+        na = self.isna()
+        if name in ("any", "all"):
+            # like floats, NA is truthy if it is not skipped
+            truthy = (self._num != 0) | na
+            values = truthy[~na] if skipna else truthy
+            return bool(values.any() if name == "any" else values.all())
+        if name not in (
+            "sum",
+            "prod",
+            "min",
+            "max",
+            "mean",
+            "median",
+            "var",
+            "std",
+            "sem",
+        ):
+            raise TypeError(
+                f"'{type(self).__name__}' does not support reduction '{name}'"
+            )
+
+        if not skipna and na.any():
+            return np.nan if name in ("std", "sem") else self.dtype.na_value
+        num, den = self._num[~na], self._den[~na]
+        n = len(num)
+
+        if name in _TREE_REDUCTIONS:
+            f, neutral = _TREE_REDUCTIONS[name]
+            if n == 0 or n < min_count:
+                if neutral is None or n < min_count:
+                    return self.dtype.na_value
+                return fr.Fraction(*neutral)
+            return _part_to_scalar(*_tree_reduce(f, num, den, neutral))
+        if n == 0:
+            return np.nan if name in ("std", "sem") else self.dtype.na_value
+        if name == "mean":
+            return _part_to_scalar(*self._mean_parts(num, den))
+        if name == "median":
+            # sorting is done with Python's Fraction, which is exact
+            values = sorted(fr.Fraction(int(a), int(b)) for a, b in zip(num, den))
+            mid = n // 2
+            return values[mid] if n % 2 == 1 else (values[mid - 1] + values[mid]) / 2
+
+        # var, std, sem
+        if n - ddof <= 0:
+            return np.nan if name in ("std", "sem") else self.dtype.na_value
+        mean_num, mean_den = self._mean_parts(num, den)
+        dev = _sub(num, den, np.full(n, mean_num[0]), np.full(n, mean_den[0]))
+        sq_num, sq_den = _tree_reduce(_add, *_mul(*dev, *dev), (0, 1))
+        var = _part_to_scalar(*_truediv(sq_num, sq_den, np.array([n - ddof]), 1))
+        if name == "var":
+            return var
+        std = float(np.sqrt(float(var)))
+        return std if name == "std" else std / np.sqrt(n)
+
+    @staticmethod
+    def _mean_parts(num, den):
+        sum_num, sum_den = _tree_reduce(_add, num, den, (0, 1))
+        return _truediv(sum_num, sum_den, np.array([len(num)]), 1)
+
+
+def _part_to_scalar(num, den):
+    """Convert a length-1 (numerators, denominators) pair to a Fraction."""
+    return fr.Fraction(int(num[0]), int(den[0]))
