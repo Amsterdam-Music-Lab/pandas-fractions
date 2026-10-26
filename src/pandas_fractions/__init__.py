@@ -204,6 +204,42 @@ def _scan(f, num, den):
 # Like the binary operations, these expect normalized inputs without NA.
 
 
+def _is_integer_typed(value) -> bool:
+    """Check if a pow exponent has an integer type (not if its values are integers)."""
+    if pd.api.types.is_scalar(value):
+        return isinstance(value, (int, np.integer))
+    dtype = getattr(value, "dtype", None)
+    if dtype is None:  # e.g. a list
+        dtype = np.asarray(value).dtype
+    return pd.api.types.is_integer_dtype(dtype) or pd.api.types.is_bool_dtype(dtype)
+
+
+def _int_pow(num, den, exponents):
+    """Raise num/den to integer exponents (exponentiation by squaring)."""
+    neg = exponents < 0
+    if np.any(neg & (num == 0)):
+        raise ZeroDivisionError("zero to a negative power")
+    # a negative exponent inverts the base, keeping the denominator positive
+    _overflow_if(neg & (num == _INT_MIN))
+    sign = np.where(num < 0, -1, 1)
+    base_num = np.where(neg, sign * den, num)
+    base_den = np.where(neg, np.abs(num), den)
+    e = np.abs(exponents)
+    result_num, result_den = np.ones_like(num), np.ones_like(den)
+    while True:
+        odd = (e & 1) == 1
+        result_num[odd] = _checked_mul(result_num[odd], base_num[odd])
+        result_den[odd] = _checked_mul(result_den[odd], base_den[odd])
+        e = e >> 1
+        # only square the bases that are still needed, to avoid spurious overflows
+        more = e > 0
+        if not more.any():
+            # powers of coprime numbers are coprime, so the result is normalized
+            return result_num, result_den
+        base_num[more] = _checked_mul(base_num[more], base_num[more])
+        base_den[more] = _checked_mul(base_den[more], base_den[more])
+
+
 def _floor(num, den):
     return num // den, np.ones_like(num)
 
@@ -301,7 +337,7 @@ class FractionArray(arraylike.OpsMixin, pd.api.extensions.ExtensionArray):
     Arithmetic with fractions and integers is exact and vectorized,
     and raises an OverflowError if an intermediate value exceeds int64.
     Arithmetic with floats returns a float ndarray, like Fraction does with float.
-    Powers are computed elementwise with Python's Fraction.
+    Powers with integer exponents are exact, other powers return floats.
     """
 
     def __init__(self, numerators: np.ndarray, denominators: np.ndarray):
@@ -457,6 +493,10 @@ class FractionArray(arraylike.OpsMixin, pd.api.extensions.ExtensionArray):
     # sorting and factorizing
     # -----------------------
 
+    def _values_for_json(self) -> np.ndarray:
+        # strings like "-1/2" are exact and parsed back by _from_sequence
+        return np.array([None if pd.isna(x) else str(x) for x in self], dtype=object)
+
     def _values_for_argsort(self) -> np.ndarray:
         """
         Return integer ranks that sort exactly like the fractions.
@@ -551,7 +591,7 @@ class FractionArray(arraylike.OpsMixin, pd.api.extensions.ExtensionArray):
 
     def _arith_method(self, other, op):
         if op in (operator.pow, roperator.rpow):
-            return self._pointwise(other, op)
+            return self._pow(other, op)
         coerced = self._coerce_other(other)
         if coerced is NotImplemented:
             return NotImplemented
@@ -577,23 +617,28 @@ class FractionArray(arraylike.OpsMixin, pd.api.extensions.ExtensionArray):
         num, den = parts
         return type(self)(np.where(na, 0, num), np.where(na, 0, den))
 
-    def _pointwise(self, other, op):
-        """Apply op elementwise using Python's Fraction."""
-        if pd.api.types.is_list_like(other):
-            if len(other) != len(self):
-                raise ValueError("Lengths must match")
-        else:
-            other = [other] * len(self)
-        results = [
-            None if pd.isna(x) or pd.isna(y) else op(x, y) for x, y in zip(self, other)
-        ]
-        # e.g. roots are floats, and roots of negative numbers are complex
-        for kind in (complex, float):
-            if any(isinstance(r, kind) for r in results):
-                return np.array(
-                    [np.nan if r is None else r for r in results], dtype=kind
-                )
-        return type(self)._from_sequence(results)
+    def _pow(self, other, op):
+        """
+        Compute self ** other (op = pow) or other ** self (op = rpow).
+
+        The result type depends only on the type of the exponent:
+        integer exponents give exact fractions, all other exponents give floats.
+        """
+        coerced = self._coerce_other(other)
+        if coerced is NotImplemented:
+            return NotImplemented
+        if op is operator.pow and _is_integer_typed(other):
+            exponents, exp_den = coerced
+            na = (self._den == 0) | (exp_den == 0)
+            num, den = np.where(na, 1, self._num), np.where(na, 1, self._den)
+            return self._with_na(_int_pow(num, den, np.where(na, 0, exponents)), na)
+        if isinstance(coerced, tuple):
+            num, den = coerced
+            coerced = np.full(len(self), np.nan)
+            np.divide(num, den, out=coerced, where=den != 0)
+        # like for float Series, invalid results (roots of negative numbers) are NaN
+        with np.errstate(all="ignore"):
+            return op(self._to_float(), coerced)
 
     def _cmp_method(self, other, op):
         coerced = self._coerce_other(other)
@@ -631,13 +676,16 @@ class FractionArray(arraylike.OpsMixin, pd.api.extensions.ExtensionArray):
         if not keepdims:
             return result
         # decide by name, not by result, since a missing fraction (NaN) is a float
-        if name in ("std", "sem", "any", "all"):
+        if name in ("std", "sem", "any", "all", "count"):
             # a numpy array, so that e.g. df.std() has dtype float64
             return np.array([result])
         return type(self)._from_sequence([result])
 
     def _reduce_scalar(self, name, *, skipna, min_count=0, ddof=1, **kwargs):
         na = self.isna()
+        if name == "count":
+            # the number of non-missing values, regardless of skipna (like Int64)
+            return np.int64(len(self) - na.sum())
         if name in ("any", "all"):
             # like floats, NA is truthy if it is not skipped
             truthy = (self._num != 0) | na

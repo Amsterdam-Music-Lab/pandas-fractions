@@ -79,16 +79,13 @@ class TestFractionArray(base.ExtensionTests):
         return True
 
     def _cast_pointwise_result(self, op_name, obj, other, pointwise_result):
-        # Powers can mix fractions and floats (e.g. 2 ** 2 and 2 ** (1/2)),
-        # which pandas' pointwise reference keeps as object,
-        # while FractionArray returns floats (or complex numbers) for the whole array.
-        if "pow" in op_name and np.all(pointwise_result.dtypes == object):
-            kind = (
-                complex
-                if pointwise_result.map(np.iscomplexobj).any(axis=None)
-                else float
-            )
-            return pointwise_result.astype(kind)
+        # The suite only uses fraction exponents, for which FractionArray returns floats,
+        # with NaN for roots of negative numbers (like float Series).
+        # pandas' pointwise reference uses Python's Fraction, which can mix
+        # fractions, floats, and complex numbers (for roots of negative numbers).
+        if "pow" in op_name:
+            to_float = lambda v: np.nan if complex(v).imag != 0 else complex(v).real
+            return pointwise_result.map(to_float, na_action="ignore").astype(float)
         return pointwise_result
 
     # The suite computes expected reductions and accumulations with float64,

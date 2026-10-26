@@ -45,7 +45,7 @@ Operations work directly on the numerator and denominator arrays using numpy,
 instead of converting each element to a Python `Fraction`.
 The results are exact, and always equal to what Python's `Fraction` would compute,
 as long as no value exceeds `int64`.
-The only exception is `**`, which is computed elementwise (see [Powers](#powers)).
+The only exception is `**` with non-integer exponents, which returns floats (see [Powers](#powers)).
 
 Operators are provided through pandas' `OpsMixin` (from `pandas.core.arraylike`).
 It defines all Python operator methods (`__add__`, `__radd__`, `__lt__`, ...)
@@ -195,18 +195,29 @@ as `roperator` already takes care of the operand order.
 
 ### Powers
 
-`**` (and its reverse) is the only operation that is computed elementwise
-with Python's `Fraction`, in `_pointwise`.
-Its result type depends on the values:
-integer exponents produce fractions,
-but other exponents usually produce irrational numbers
-(`Fraction(2) ** Fraction(1, 2)` is a float),
-so a vectorized implementation would gain little.
-If any element produces a complex number (e.g. a root of a negative number),
-the whole result is returned as a complex128 numpy array,
-otherwise, if any element produces a float, as a float64 numpy array,
-and otherwise as a `FractionArray`, where too large values raise an `OverflowError` during construction.
-Missing values propagate as usual.
+For Python's `Fraction`, the type of `x ** y` depends on the values:
+integer exponents give fractions,
+other exponents usually give floats (`Fraction(2) ** Fraction(1, 2)`),
+and roots of negative numbers give complex numbers.
+For a pandas dtype, a result type that depends on the values would be a trap
+(e.g. a column that turns complex for some inputs, or an empty Series with a different dtype),
+so `_pow` decides the result type only from the *type* of the exponent, like numpy does:
+
+- **Integer exponents** (Python or numpy integers, integer or boolean arrays, pandas' nullable integers)
+  give an exact `FractionArray`.
+  `_int_pow` computes the powers with exponentiation by squaring on the whole array,
+  using the checked multiplication, so too large results raise an `OverflowError`.
+  It only squares the bases that are still needed for an element's exponent,
+  so that large intermediate squares don't cause spurious overflows.
+  A negative exponent inverts the base first, so `0 ** -1` raises a `ZeroDivisionError`.
+  The result is already normalized, since powers of coprime numbers are coprime.
+- **All other exponents** (fractions, floats, and `FractionArray`s, even with integer values)
+  and `y ** x` with a `FractionArray` `x` as the exponent
+  give a float64 numpy array, computed from the float values.
+  Like for float Series, roots of negative numbers are `NaN` (without a warning).
+  To get exact results for integer exponents stored as fractions, convert them to integers first.
+
+Missing values (in the base or the exponent) propagate as usual.
 
 ### Comparisons
 
@@ -250,7 +261,8 @@ but wrapping the result as a `NumpyExtensionArray` would give `df.std()` the unu
 Reductions whose result is always rational return an exact `Fraction`:
 `sum`, `prod`, `min`, `max`, `mean`, `median`, and `var`.
 `std` and `sem` involve a square root, so they return a `float`, computed from the exact variance.
-`any` and `all` return a `bool`.
+`any` and `all` return a `bool`,
+and `count` returns the number of non-missing values (regardless of `skipna`).
 `skew` and `kurt` are not supported and raise a `TypeError`.
 
 ### Missing values and empty inputs
@@ -445,6 +457,10 @@ while copies (e.g. `copy()`, or selecting with a mask) are writeable again.
   Since a conversion always creates a new array,
   `np.asarray(x, copy=False)` raises a `ValueError` (as required by numpy's `__array__` protocol),
   and the result of `to_numpy` is never read-only.
+- **JSON (`_values_for_json`).**
+  `to_json` writes fractions as strings like `"-1/2"`, and missing values as `null`.
+  Unlike numbers, strings are exact, and `pd.read_json(..., dtype="frac")` parses them back.
+  `_values_for_json` was added in pandas 3.1, which is therefore the minimum supported version.
 
 ## Sorting and factorizing
 

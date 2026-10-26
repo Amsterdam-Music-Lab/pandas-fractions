@@ -1,3 +1,4 @@
+import io
 import operator
 import statistics
 from fractions import Fraction as F
@@ -532,8 +533,6 @@ def test_combine_keeps_result_dtype():
 
 
 def test_read_csv():
-    import io
-
     csv = io.StringIO("a\n1/2\n\n3\n-0.25\n")
     df = pd.read_csv(csv, dtype={"a": "frac"}, skip_blank_lines=False)
     assert df["a"].dtype == "frac"
@@ -541,11 +540,55 @@ def test_read_csv():
     assert df["a"].dropna().tolist() == [F(1, 2), F(3), F(-1, 4)]
 
 
-def test_pow_complex():
-    result = pd.Series([F(-1, 4), F(1, 4), None], dtype="frac") ** F(1, 2)
-    assert result.dtype == np.complex128
-    np.testing.assert_allclose(result[:2], [0.5j, 0.5])
-    assert np.isnan(result[2])
+def test_pow_float():
+    s = pd.Series([F(-1, 4), F(1, 4), None], dtype="frac")
+    result = s ** F(1, 2)
+    assert result.dtype == np.float64
+    # like float Series, roots of negative numbers are NaN
+    assert np.isnan(result[0]) and result[1] == 0.5 and np.isnan(result[2])
+    # fraction exponents give floats, even if they are integers
+    assert (s ** F(2)).dtype == np.float64
+    assert (s**s).dtype == np.float64
+
+
+def test_pow_type_stable():
+    # the result type depends only on the exponent's type, not on the values
+    empty = pd.Series([], dtype="frac")
+    assert (empty**2).dtype == "frac"
+    assert (empty ** F(1, 2)).dtype == np.float64
+    assert (2**empty).dtype == np.float64
+
+
+def test_pow_integer_exponents():
+    rng = np.random.default_rng(5)
+    xs = random_fractions(rng, 100, nonzero=True, max_den=5)
+    exponents = rng.integers(-5, 6, 100)
+    x = FractionArray._from_sequence(xs)
+    assert (x**exponents).tolist() == [a ** int(e) for a, e in zip(xs, exponents)]
+    assert (x**-3).tolist() == [a**-3 for a in xs]
+    with_na = pd.Series([F(1, 2), None, F(2)], dtype="frac")
+    exps = pd.array([2, 3, None], dtype="Int64")
+    assert (with_na**exps).isna().tolist() == [False, True, True]
+    with pytest.raises(ZeroDivisionError):
+        FractionArray._from_sequence([0]) ** -1
+    big = FractionArray._from_sequence([F(1, 3)])
+    assert (big**39).tolist() == [F(1, 3) ** 39]
+    with pytest.raises(OverflowError):
+        big**40
+
+
+def test_count():
+    s = pd.Series([F(1, 2), None, F(2)], dtype="frac")
+    assert s.array._reduce("count") == 2
+    assert s.array._reduce("count", skipna=False) == 2
+    assert pd.DataFrame({"a": s}).count().tolist() == [2]
+
+
+def test_json_roundtrip():
+    s = pd.Series([F(1, 2), F(-2, 3), None, F(4)], dtype="frac")
+    assert s.to_json() == '{"0":"1\\/2","1":"-2\\/3","2":null,"3":"4"}'
+    result = pd.read_json(io.StringIO(s.to_json()), typ="series", dtype="frac")
+    pd.testing.assert_series_equal(result, s)
 
 
 # read-only arrays
