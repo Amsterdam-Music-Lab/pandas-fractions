@@ -1,10 +1,11 @@
+import operator
 from fractions import Fraction as F
 
 import numpy as np
 import pandas as pd
 import pytest
 
-import pandas_fractions  # noqa: F401  (registers the "frac" dtype)
+from pandas_fractions import FractionArray  # also registers the "frac" dtype
 
 
 @pytest.fixture
@@ -57,3 +58,173 @@ def test_groupby_first(s):
     result = df.groupby("k")["a"].first()
     assert result.dtype == s.dtype
     assert result.to_dict() == {"x": F(1, 2), "y": F(1, 3)}
+
+
+# arithmetic
+# ----------
+
+BINARY_OPS = [
+    operator.add,
+    operator.sub,
+    operator.mul,
+    operator.truediv,
+    operator.floordiv,
+    operator.mod,
+]
+
+
+def random_fractions(rng, n, nonzero=False):
+    num = rng.integers(-1000, 1000, n)
+    if nonzero:
+        num[num == 0] = 1
+    den = rng.integers(1, 1000, n)
+    return [F(int(a), int(b)) for a, b in zip(num, den)]
+
+
+def assert_normalized(arr):
+    valid = arr._den != 0
+    assert np.all(arr._den[valid] > 0)
+    assert np.all(np.gcd(arr._num[valid], arr._den[valid]) == 1)
+
+
+@pytest.mark.parametrize("op", BINARY_OPS)
+def test_arith_matches_python(op):
+    rng = np.random.default_rng(42)
+    xs = random_fractions(rng, 200)
+    ys = random_fractions(rng, 200, nonzero=True)
+    x = FractionArray._from_sequence(xs)
+    y = FractionArray._from_sequence(ys)
+    result = op(x, y)
+    assert result.tolist() == [op(a, b) for a, b in zip(xs, ys)]
+    assert_normalized(result)
+
+
+@pytest.mark.parametrize("op", BINARY_OPS)
+@pytest.mark.parametrize("scalar", [3, -2, F(-5, 7)])
+def test_arith_with_scalar(op, scalar):
+    xs = [F(1, 2), F(-7, 3), F(5, 4), F(1)]
+    x = FractionArray._from_sequence(xs)
+    assert op(x, scalar).tolist() == [op(a, scalar) for a in xs]
+    assert op(scalar, x).tolist() == [op(scalar, a) for a in xs]
+
+
+def test_arith_with_int_array():
+    x = FractionArray._from_sequence([F(1, 2), F(1, 3)])
+    assert (x + np.array([1, 2])).tolist() == [F(3, 2), F(7, 3)]
+    assert (np.array([1, 2]) - x).tolist() == [F(1, 2), F(5, 3)]
+
+
+def test_divmod():
+    xs = [F(7, 2), F(-7, 2), F(1, 3)]
+    x = FractionArray._from_sequence(xs)
+    q, r = divmod(x, F(2, 3))
+    assert list(zip(q.tolist(), r.tolist())) == [divmod(a, F(2, 3)) for a in xs]
+    q, r = divmod(5, x)
+    assert list(zip(q.tolist(), r.tolist())) == [divmod(5, a) for a in xs]
+
+
+def test_series_arith(s):
+    assert (s + s).tolist()[:3] == [F(1), F(6), F(2, 3)]
+    assert (s * 2).dtype == s.dtype
+    assert (1 / s.dropna()).tolist() == [F(2), F(1, 3), F(3), F(4)]
+    assert (s.dropna() - s.dropna()).tolist() == [F(0)] * 4
+
+
+def test_arith_propagates_na(s):
+    for result in [s + 1, 1 - s, s * s, s / F(1, 2), s // 1, s % 1, -s]:
+        assert result.isna().tolist() == [False, False, False, True, False]
+    assert (s + None).isna().all()
+    # NA in the divisor is NA, not a division by zero
+    assert (s.array / s.array).isna().tolist() == [False, False, False, True, False]
+
+
+def test_division_by_zero():
+    x = FractionArray._from_sequence([F(1, 2), F(1, 3)])
+    with pytest.raises(ZeroDivisionError):
+        x / 0
+    with pytest.raises(ZeroDivisionError):
+        x // FractionArray._from_sequence([1, 0])
+    with pytest.raises(ZeroDivisionError):
+        1 % FractionArray._from_sequence([0, 1])
+
+
+def test_overflow():
+    big = 2**62
+    x = FractionArray._from_sequence([big])
+    with pytest.raises(OverflowError):
+        x * 2
+    with pytest.raises(OverflowError):
+        x + x
+    with pytest.raises(OverflowError):
+        FractionArray._from_sequence([F(1, big)]) + F(1, 3)
+    # reducing before multiplying avoids overflow when the result fits
+    assert (x * F(1, 2)).tolist() == [F(2**61)]
+    assert (FractionArray._from_sequence([F(1, big)]) + F(1, big)).tolist() == [
+        F(1, 2**61)
+    ]
+
+
+def test_float_operands(s):
+    result = s + 0.5
+    assert result.dtype == np.float64
+    assert result.tolist()[:3] == [1.0, 3.5, 1 / 3 + 0.5]
+    assert np.isnan(result.iloc[3])
+    assert (s.array * np.array([2.0] * 5)).dtype == np.float64
+
+
+def test_pow():
+    xs = [F(1, 2), F(-2, 3), F(4)]
+    x = FractionArray._from_sequence(xs)
+    assert (x**2).tolist() == [F(1, 4), F(4, 9), F(16)]
+    assert (x**-1).tolist() == [F(2), F(-3, 2), F(1, 4)]
+    assert (x ** np.array([0, 1, 2])).tolist() == [F(1), F(-2, 3), F(16)]
+    assert (2**x).dtype == np.float64
+    assert (abs(x) ** F(1, 2)).dtype == np.float64  # roots are irrational
+
+
+def test_unary():
+    x = FractionArray._from_sequence([F(1, 2), F(-2, 3), None])
+    assert (-x).tolist()[:2] == [F(-1, 2), F(2, 3)]
+    assert abs(x).tolist()[:2] == [F(1, 2), F(2, 3)]
+    assert (+x).tolist()[:2] == [F(1, 2), F(-2, 3)]
+    assert (-x).isna().tolist() == [False, False, True]
+
+
+# comparison
+# ----------
+
+CMP_OPS = [operator.eq, operator.ne, operator.lt, operator.le, operator.gt, operator.ge]
+
+
+@pytest.mark.parametrize("op", CMP_OPS)
+def test_cmp_matches_python(op):
+    rng = np.random.default_rng(0)
+    xs = random_fractions(rng, 200)
+    ys = xs[:50] + random_fractions(rng, 150)  # include some equal pairs
+    result = op(FractionArray._from_sequence(xs), FractionArray._from_sequence(ys))
+    assert result.dtype == bool
+    assert result.tolist() == [op(a, b) for a, b in zip(xs, ys)]
+
+
+def test_cmp_na(s):
+    assert (s == F(1, 3)).tolist() == [False, False, True, False, False]
+    assert (s != 3).tolist() == [True, False, True, True, True]
+    assert (s < 1).tolist() == [True, False, True, False, True]
+    assert (s >= None).tolist() == [False] * 5
+
+
+def test_cmp_with_float_and_incomparable(s):
+    assert (s > 0.4).tolist() == [True, True, False, False, False]
+    assert (s == "a").tolist() == [False] * 5
+    assert (s != "a").tolist() == [True] * 5
+    with pytest.raises(TypeError):
+        s < "a"
+
+
+def test_cmp_large_values():
+    # cross-multiplication overflows int64, comparison falls back to Python ints
+    big = 2**62
+    x = FractionArray._from_sequence([F(big - 1, big)])
+    y = FractionArray._from_sequence([F(big - 2, big - 1)])
+    assert (x > y).tolist() == [True]
+    assert (x == y).tolist() == [False]
