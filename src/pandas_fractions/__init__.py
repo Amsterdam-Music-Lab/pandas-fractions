@@ -159,6 +159,22 @@ _TREE_REDUCTIONS = {
 }
 
 
+def _scan(f, num, den):
+    """
+    Compute the prefix reductions (inclusive scan) of arrays of fractions.
+
+    Uses the Hillis-Steele algorithm: in step k, every element is combined
+    with the element 2^k positions before it, so each step is vectorized.
+    """
+    num, den = num.copy(), den.copy()
+    k = 1
+    while k < len(num):
+        # the right-hand side is computed before assigning, so it uses the old values
+        num[k:], den[k:] = f(num[:-k], den[:-k], num[k:], den[k:])
+        k *= 2
+    return num, den
+
+
 _ARITH_OPS = {
     operator.add: _add,
     operator.sub: _sub,
@@ -444,6 +460,33 @@ class FractionArray(OpsMixin, pd.api.extensions.ExtensionArray):
     def _mean_parts(num, den):
         sum_num, sum_den = _tree_reduce(_add, num, den, (0, 1))
         return _truediv(sum_num, sum_den, np.array([len(num)]), 1)
+
+    # accumulations
+    # -------------
+
+    def _accumulate(self, name: str, *, skipna=True, **kwargs):
+        if name not in ("cumsum", "cumprod", "cummin", "cummax"):
+            raise TypeError(
+                f"'{type(self).__name__}' does not support accumulation '{name}'"
+            )
+        f, neutral = _TREE_REDUCTIONS[name.removeprefix("cum")]
+        na = self.isna()
+        if not na.any():
+            return type(self)(*_scan(f, self._num, self._den))
+        if not skipna:
+            # everything from the first NA on is NA
+            na = np.logical_or.accumulate(na)
+        if na.all():
+            zeros = np.zeros(len(self), np.int64)
+            return type(self)(zeros, zeros.copy())
+        # fill NA with a value that doesn't change the result:
+        # the neutral element, or the first valid value for min and max
+        if neutral is None:
+            first = np.argmin(na)
+            neutral = (self._num[first], self._den[first])
+        num = np.where(na, neutral[0], self._num)
+        den = np.where(na, neutral[1], self._den)
+        return self._with_na(_scan(f, num, den), na)
 
 
 def _part_to_scalar(num, den):

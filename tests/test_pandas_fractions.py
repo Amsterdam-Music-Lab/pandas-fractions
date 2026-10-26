@@ -318,3 +318,65 @@ def test_dataframe_reductions(s):
     assert result.dtype == s.dtype
     assert result.tolist() == [F(49, 12), F(49, 6)]
     assert df.agg(["min", "max"])["b"].tolist() == [F(1, 2), F(6)]
+
+
+# accumulations
+# -------------
+
+ACCUMULATIONS = {
+    "cumsum": operator.add,
+    "cumprod": operator.mul,
+    "cummin": min,
+    "cummax": max,
+}
+
+
+def python_accumulate(f, xs, skipna):
+    """Reference implementation with pandas' NA semantics."""
+    result, acc, seen_na = [], None, False
+    for x in xs:
+        seen_na = seen_na or x is None
+        if x is None or (seen_na and not skipna):
+            result.append(None)
+            continue
+        acc = x if acc is None else f(acc, x)
+        result.append(acc)
+    return result
+
+
+@pytest.mark.parametrize("name", list(ACCUMULATIONS))
+@pytest.mark.parametrize("skipna", [True, False])
+def test_accumulate_matches_python(name, skipna):
+    rng = np.random.default_rng(2)
+    for n in [1, 2, 7, 33]:
+        xs = random_fractions(rng, n, nonzero=True, max_den=7)
+        if name == "cumprod":
+            xs = [x / abs(x.numerator) for x in xs]  # keep products small
+        for i in rng.integers(0, n, n // 5):
+            xs[i] = None
+        result = getattr(pd.Series(xs, dtype="frac"), name)(skipna=skipna)
+        assert result.dtype == "frac"
+        expected = python_accumulate(ACCUMULATIONS[name], xs, skipna)
+        assert [None if pd.isna(x) else x for x in result] == expected
+
+
+def test_accumulate_edge_cases():
+    empty = pd.Series([], dtype="frac")
+    assert empty.cumsum().tolist() == []
+    all_na = pd.Series([None, None], dtype="frac")
+    assert all_na.cumsum().isna().all()
+    leading_na = pd.Series([None, F(1, 2), F(1, 3)], dtype="frac")
+    assert leading_na.cummin().tolist()[1:] == [F(1, 2), F(1, 3)]
+    assert leading_na.cumsum(skipna=False).isna().all()
+
+
+def test_accumulate_overflow():
+    with pytest.raises(OverflowError):
+        pd.Series([2**62, 2**62], dtype="frac").cumsum()
+
+
+def test_accumulate_dataframe():
+    df = pd.DataFrame({"a": pd.Series([F(1, 2), F(1, 3)], dtype="frac")})
+    result = df.cumsum()
+    assert result["a"].dtype == "frac"
+    assert result["a"].tolist() == [F(1, 2), F(5, 6)]

@@ -277,7 +277,35 @@ which falls back to Python integers instead of overflowing.
   sums them with the tree reduction, and divides by `n - ddof`.
 - `std` is the square root of `var` as a float, and `sem` is `std / sqrt(n)`.
 
+## Accumulations
+
+`cumsum`, `cumprod`, `cummin`, and `cummax` are implemented in `_accumulate`.
+They return a `FractionArray` of the same length
+and reuse the binary operations and neutral elements of the corresponding reductions.
+
+### Vectorized scan
+
+The prefix results are computed by `_scan` with the Hillis–Steele algorithm:
+in round k, each element is combined with the element 2^k positions before it.
+After about log₂(n) vectorized rounds, every element holds the reduction of all elements up to it.
+This does more work than a sequential loop (O(n log n) instead of O(n) operations),
+but each round is a single numpy operation instead of n Python-level steps.
+Overflow is handled by the checked operations, as everywhere else.
+
+### Missing values
+
+Missing values follow the semantics of pandas' float accumulations:
+
+- With `skipna=True` (the default), missing positions stay missing in the result,
+  and the accumulation continues after them as if they weren't there.
+  This is implemented by temporarily filling the missing positions with a value that
+  doesn't affect the result: the neutral element for `cumsum` (`0`) and `cumprod` (`1`).
+  `cummin` and `cummax` have no neutral element in the fractions,
+  so missing positions are filled with the first valid value instead,
+  which is part of every prefix that contains a valid value anyway.
+  The filled positions are set back to missing afterwards.
+- With `skipna=False`, every position from the first missing value on is missing.
+
 ## Not yet implemented
 
 - numpy ufuncs (via `__array_ufunc__`), e.g. `np.add(x, y)`.
-- Cumulative operations like `cumsum` (via `_accumulate`).
