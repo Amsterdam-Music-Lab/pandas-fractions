@@ -309,6 +309,20 @@ class FractionArray(arraylike.OpsMixin, pd.api.extensions.ExtensionArray):
         item = pd.api.indexers.check_array_indexer(self, item)
         return type(self)(self._num[item], self._den[item])
 
+    def __setitem__(self, key, value):
+        key = pd.api.indexers.check_array_indexer(self, key)
+        if pd.api.types.is_scalar(value):
+            num, den = _to_parts(value)
+        else:
+            if not isinstance(value, FractionArray):
+                value = type(self)._from_sequence(value)
+            num, den = value._num, value._den
+        # convert both parts before assigning,
+        # so that an overflow can't leave the array half-modified
+        num, den = np.asarray(num, np.int64), np.asarray(den, np.int64)
+        self._num[key] = num
+        self._den[key] = den
+
     def __len__(self) -> int:
         return len(self._num)
 

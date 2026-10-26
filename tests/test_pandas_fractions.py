@@ -457,3 +457,62 @@ def test_ufunc_series(x):
     assert np.floor(s).dtype == "frac"
     assert np.add(s, s).dtype == "frac"
     assert np.sqrt(abs(s)).dtype == np.float64
+
+
+# item assignment
+# ---------------
+
+
+def test_setitem_keys():
+    x = FractionArray._from_sequence([F(1, 2), 3, None, F(1, 4)])
+    x[0] = F(2, 3)
+    x[1:3] = [1, "5/6"]
+    x[np.array([False, False, False, True])] = 0.5
+    x[[0, 1]] = FractionArray._from_sequence([F(-1, 3), None])
+    assert x.tolist()[2:] == [F(5, 6), F(1, 2)]
+    assert x[0] == F(-1, 3)
+    assert x.isna().tolist() == [False, True, False, False]
+    assert_normalized(x)
+
+
+def test_setitem_na():
+    x = FractionArray._from_sequence([F(1, 2), F(1, 3), F(1, 4)])
+    x[0] = None
+    x[1] = pd.NA
+    x[2] = np.nan
+    assert x.isna().all()
+
+
+def test_setitem_invalid_leaves_array_unchanged():
+    x = FractionArray._from_sequence([F(1, 2), F(1, 3)])
+    for value in [2**70, F(1, 2**70), "abc"]:
+        with pytest.raises((OverflowError, ValueError)):
+            x[0] = value
+    with pytest.raises(ValueError):
+        x[:] = [1, 2, 3]
+    assert x.tolist() == [F(1, 2), F(1, 3)]
+
+
+def test_setitem_slice_is_view():
+    x = FractionArray._from_sequence([F(1, 2), F(1, 3), F(1, 4)])
+    view = x[1:]
+    view[0] = 7
+    assert x[1] == F(7)
+
+
+def test_setitem_series():
+    s = pd.Series([F(1, 2), None, 3], dtype="frac")
+    assert s.fillna(0).tolist() == [F(1, 2), F(0), F(3)]
+    assert s.where(s.isna() | (s > 1), F(-1)).tolist()[::2] == [F(-1), F(3)]
+    s.iloc[0] = 7
+    s.loc[1] = F(1, 3)
+    s[s > 5] = F(5)
+    assert s.tolist() == [F(5), F(1, 3), F(3)]
+    assert s.dtype == "frac"
+
+
+def test_ufunc_out_fraction_array():
+    x = FractionArray._from_sequence([F(7, 2), F(-5, 2), None])
+    np.floor(x, out=x)
+    assert x.tolist()[:2] == [F(3), F(-3)]
+    assert x.isna()[2]

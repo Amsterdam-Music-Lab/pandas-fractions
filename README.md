@@ -326,9 +326,11 @@ otherwise the ufunc is computed with floats.
    They behave exactly like the operators, including overflow checks and missing values.
 3. **`out` argument.**
    If an `out` argument is given, the ufunc is computed without it,
-   and the result is copied into `out` (pandas' `dispatch_ufunc_with_out`).
-   Since `FractionArray` doesn't support item assignment yet,
-   `out` must be a numpy array, so this only works for ufuncs with float or boolean results.
+   and the result is copied into `out` (pandas' `dispatch_ufunc_with_out`)
+   using item assignment (see [Item assignment](#item-assignment)).
+   `out` can be a `FractionArray` (e.g. `np.floor(x, out=x)`)
+   or a numpy array, if the result can be converted to its dtype.
+   The `where` argument only works with numpy arrays as `out`.
 4. **Reductions and accumulations.**
    `reduce` and `accumulate` of `add`, `multiply`, `minimum`, and `maximum`
    are forwarded to `_reduce` (`sum`, `prod`, `min`, `max`)
@@ -358,6 +360,30 @@ otherwise the ufunc is computed with floats.
 Missing values in the exact unary ufuncs are handled like in arithmetic:
 they are replaced by `1/1` for the computation and set back to missing in the result.
 
-## Not yet implemented
+## Item assignment
 
-- Item assignment (`__setitem__`), e.g. `x[0] = Fraction(1, 2)` or `np.floor(x, out=x)`.
+`__setitem__` supports `x[key] = value` on a `FractionArray`.
+pandas builds many operations on top of it,
+such as assignment via `s.iloc[...]`, `s.loc[...]`, or a mask (`s[s > 5] = 5`),
+and `fillna`, `where`, and `mask`.
+
+- **Keys** can be anything that `__getitem__` accepts:
+  integers, slices, boolean masks, and integer arrays.
+  Like in `__getitem__`, array keys are first normalized with `check_array_indexer`.
+- **Values** are converted like in the constructor:
+  a scalar with `_to_parts` (so `Fraction`s, `int`s, `float`s, and strings like `"1/2"` are accepted,
+  and `None`, `np.nan`, or `pd.NA` set a missing value),
+  a sequence with `_from_sequence`.
+  The assignment itself is done by numpy on the numerator and denominator arrays,
+  so a scalar is broadcast to all selected positions,
+  and a sequence of the wrong length raises a `ValueError`.
+  Assigned values are always normalized, since they come from `Fraction`s or a `FractionArray`.
+- **Errors leave the array unchanged.**
+  Both parts are converted to `int64` before either array is modified,
+  so a value that is invalid or too large (raising an `OverflowError`)
+  can't result in a numerator being changed without its denominator.
+
+Note that slicing a `FractionArray` returns a *view* on the same numerator and denominator arrays,
+like slicing a numpy array or other pandas extension arrays.
+Assigning to a slice therefore also changes the original array.
+Selecting with masks or integer arrays creates a copy.
