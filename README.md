@@ -196,8 +196,10 @@ integer exponents produce fractions,
 but other exponents usually produce irrational numbers
 (`Fraction(2) ** Fraction(1, 2)` is a float),
 so a vectorized implementation would gain little.
-If any element produces a float, the whole result is returned as a float64 numpy array,
-otherwise as a `FractionArray`, where too large values raise an `OverflowError` during construction.
+If any element produces a complex number (e.g. a root of a negative number),
+the whole result is returned as a complex128 numpy array,
+otherwise, if any element produces a float, as a float64 numpy array,
+and otherwise as a `FractionArray`, where too large values raise an `OverflowError` during construction.
 Missing values propagate as usual.
 
 ### Comparisons
@@ -228,6 +230,14 @@ the interface pandas uses for all reductions of extension arrays.
 `_reduce` computes a scalar in `_reduce_scalar`,
 and wraps it in an array of length 1 if pandas asks for `keepdims=True`
 (which it does for `DataFrame` reductions, so that the result column keeps the `frac` dtype).
+Whether the wrapped result is a `FractionArray` or a numpy array depends only on the name of the reduction,
+not on the result,
+since a missing fraction is represented by `NaN`, which is a float.
+For example, `df.sum(min_count=...)` returns a `frac` column even if the sums are missing,
+while `df.std()` returns a float64 column.
+pandas' extension test suite expects an extension array here even for float results,
+but wrapping the result as a `NumpyExtensionArray` would give `df.std()` the unusual dtype
+`NumpyEADtype('float64')`, so these checks are marked as expected failures (see [Testing](#testing)).
 
 ### Result types
 
@@ -387,3 +397,97 @@ Note that slicing a `FractionArray` returns a *view* on the same numerator and d
 like slicing a numpy array or other pandas extension arrays.
 Assigning to a slice therefore also changes the original array.
 Selecting with masks or integer arrays creates a copy.
+
+### Read-only arrays
+
+pandas 3 can mark an extension array as read-only by setting its `_readonly` attribute,
+e.g. to protect data shared between objects under copy-on-write.
+Assigning to a read-only `FractionArray` raises `ValueError("Cannot modify read-only array")`,
+and so does everything built on assignment, like `fillna(..., copy=False)`.
+
+`_readonly` is not stored as a separate attribute, but as a property on the `writeable` flag
+of the numerator and denominator arrays.
+This way, numpy takes care of the propagation:
+views of a read-only array (e.g. slices) are read-only as well,
+while copies (e.g. `copy()`, or selecting with a mask) are writeable again.
+
+## Construction and conversion
+
+- **Strict construction (`_from_scalars`).**
+  pandas uses `_from_scalars` to decide whether the results of a pointwise operation
+  (e.g. `Series.combine`) can be stored with the original dtype.
+  `_from_sequence` accepts anything that `Fraction()` accepts, including bools, floats, and strings,
+  so `_from_scalars` checks that every value is a `Fraction`, an integer (but not a bool), or missing,
+  and raises a `TypeError` otherwise.
+  This way, e.g. `s.combine(s, lambda a, b: a <= b)` returns a `bool` Series instead of fractions.
+- **Parsing (`_from_sequence_of_strings`)** is used by parsers like `pd.read_csv(..., dtype={"a": "frac"})`.
+  It accepts everything `Fraction()` parses, e.g. `"3"`, `"-1/2"`, or `"0.25"`.
+  Empty strings are missing values.
+- **Common dtype (`FractionDType._get_common_dtype`).**
+  When arrays of different dtypes are combined, e.g. by `pd.concat`,
+  the result has the `frac` dtype if all other dtypes are integers
+  (numpy or pandas' nullable integers), since fractions represent all integers exactly.
+  With any other dtype (including floats and bools), the result has the `object` dtype.
+- **Conversion to numpy (`to_numpy`, `__array__`, `astype`).**
+  - Converting to float computes `num / den` on the whole array, with missing values as `NaN`.
+  - Converting to integers truncates towards zero, like `int(Fraction)`,
+    and raises a `ValueError` if there are missing values.
+  - Converting to `object` (the default for `to_numpy` and `np.asarray`)
+    creates an array of `Fraction`s with `NaN` (or the given `na_value`) for missing values.
+  - Other target dtypes (e.g. pandas' `"string"`) use pandas' default implementation.
+
+  Since a conversion always creates a new array,
+  `np.asarray(x, copy=False)` raises a `ValueError` (as required by numpy's `__array__` protocol),
+  and the result of `to_numpy` is never read-only.
+
+## Sorting and factorizing
+
+pandas' default implementations of sorting and factorizing work on `object` arrays of `Fraction`s,
+which is correct, but slow.
+`FractionArray` implements both directly on the numerators and denominators.
+
+### Sorting
+
+Sorting methods (`sort_values`, `argsort`, `argmin`, `rank`, ...) use `_values_for_argsort`,
+which returns an array that sorts in the same order as the fractions.
+`FractionArray` returns integer *ranks*: equal fractions get equal ranks,
+and missing values get the highest rank (pandas handles their position separately anyway).
+
+The order is computed by `_exact_order`.
+Most of the time, sorting by the float values gives the exact order:
+integers up to 2^53 are exact floats, and then `num / den` is correctly rounded,
+so `a < b` implies `float(a) <= float(b)`.
+The order can only be wrong between distinct fractions that are equal as floats,
+which would be adjacent after sorting.
+`_exact_order` checks for such pairs (and for numerators or denominators larger than 2^53)
+and, only if there are any, falls back to sorting with Python's `Fraction`.
+
+### Factorizing
+
+`factorize` (used e.g. by `pd.factorize` and `groupby`)
+assigns an integer code to each distinct value.
+Since all fractions are normalized, two fractions are equal exactly if their parts are equal,
+so the distinct values are the distinct (numerator, denominator) rows, which `np.unique` finds.
+Like pandas, the codes are numbered in the order of first appearance.
+Missing values (stored as `0/0`) get the code -1,
+or, with `use_na_sentinel=False`, their own code like any other value.
+`unique` returns the unique values of `factorize(use_na_sentinel=False)`,
+i.e. in order of appearance and including a missing value, as pandas' `unique` does.
+Other methods like `value_counts` and `duplicated` still use pandas' default implementations.
+
+## Testing
+
+`tests/test_pandas_fractions.py` contains the tests for this package,
+which compare the results to Python's `Fraction` where possible.
+
+`tests/test_pandas_extension_suite.py` runs pandas' own test suite for extension arrays
+(`pandas.tests.extension.base`) against `FractionArray`,
+which checks that it implements the `ExtensionArray` interface the way pandas expects.
+It needs pandas' test fixtures, which `tests/conftest.py` loads as pytest plugins,
+and `hypothesis`, which pandas' fixtures depend on.
+The suite is configured by the fixtures and overridden methods in that file:
+the fixtures provide example data,
+and the methods declare which operations are supported and how to compute the expected results
+(e.g. comparing exact results with float64 results approximately).
+The skipped tests are the ones for 2D arrays, which only pandas' internal arrays need to support,
+and the ones that require `pyarrow`.

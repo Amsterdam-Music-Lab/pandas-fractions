@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from pandas_fractions import FractionArray  # also registers the "frac" dtype
+from pandas_fractions import FractionArray, FractionDType  # registers the "frac" dtype
 
 
 @pytest.fixture
@@ -516,3 +516,137 @@ def test_ufunc_out_fraction_array():
     np.floor(x, out=x)
     assert x.tolist()[:2] == [F(3), F(-3)]
     assert x.isna()[2]
+
+
+# strict scalars, strings, and powers
+# -----------------------------------
+
+
+def test_combine_keeps_result_dtype():
+    s = pd.Series([F(1, 2), F(3, 2)], dtype="frac")
+    assert s.combine(s, lambda a, b: a <= b).dtype == bool
+    assert s.combine(s, lambda a, b: float(a)).dtype == np.float64
+    assert s.combine(s, operator.add).dtype == "frac"
+    with pytest.raises(TypeError):
+        FractionArray._from_scalars([True, F(1)], dtype=FractionDType())
+
+
+def test_read_csv():
+    import io
+
+    csv = io.StringIO("a\n1/2\n\n3\n-0.25\n")
+    df = pd.read_csv(csv, dtype={"a": "frac"}, skip_blank_lines=False)
+    assert df["a"].dtype == "frac"
+    assert df["a"].isna().tolist() == [False, True, False, False]
+    assert df["a"].dropna().tolist() == [F(1, 2), F(3), F(-1, 4)]
+
+
+def test_pow_complex():
+    result = pd.Series([F(-1, 4), F(1, 4), None], dtype="frac") ** F(1, 2)
+    assert result.dtype == np.complex128
+    np.testing.assert_allclose(result[:2], [0.5j, 0.5])
+    assert np.isnan(result[2])
+
+
+# read-only arrays
+# ----------------
+
+
+def test_readonly():
+    x = FractionArray._from_sequence([F(1, 2), None, F(1, 3)])
+    assert not x._readonly
+    x._readonly = True
+    with pytest.raises(ValueError, match="read-only"):
+        x[0] = 1
+    with pytest.raises(ValueError, match="read-only"):
+        x.fillna(0, copy=False)
+    assert x[1:]._readonly  # views stay read-only
+    assert not x.copy()._readonly
+    assert not x[[0, 1]]._readonly  # selections are copies
+    assert x.fillna(0).tolist() == [F(1, 2), F(0), F(1, 3)]
+    assert x.isna().tolist() == [False, True, False]
+
+
+# conversion
+# ----------
+
+
+def test_keepdims_reductions():
+    s = pd.Series([F(1, 2), F(3, 2)], dtype="frac")
+    df = pd.DataFrame({"a": s, "b": s})
+    assert df.std().dtype == np.float64
+    assert df.sum().dtype == "frac"
+    # a missing sum is still a fraction, not a float
+    assert df.sum(min_count=3).dtype == "frac"
+    assert df.sum(min_count=3).isna().all()
+
+
+def test_concat_common_dtype():
+    s = pd.Series([F(1, 2)], dtype="frac")
+    assert pd.concat([s, pd.Series([1, 2])]).dtype == "frac"
+    assert pd.concat([s, pd.Series([1, None], dtype="Int64")]).tolist()[:2] == [
+        F(1, 2),
+        F(1),
+    ]
+    assert pd.concat([s, pd.Series([1.5])]).dtype == object
+    assert pd.concat([s, pd.Series([True])]).dtype == object
+
+
+def test_to_numpy_and_astype():
+    x = FractionArray._from_sequence([F(7, 2), F(-7, 2), None])
+    assert x.to_numpy().dtype == object
+    assert x.to_numpy().tolist()[:2] == [F(7, 2), F(-7, 2)]
+    assert x.to_numpy(na_value=None)[2] is None
+    np.testing.assert_array_equal(x.astype(float), [3.5, -3.5, np.nan])
+    np.testing.assert_array_equal(np.asarray(x, dtype=np.float32), [3.5, -3.5, np.nan])
+    assert x.astype("frac") is not x
+    assert x.astype("frac", copy=False) is x
+    assert x[:2].astype(int).tolist() == [3, -3]  # truncated, like int(Fraction)
+    with pytest.raises(ValueError):
+        x.astype(int)
+    assert x.astype("string").tolist()[:2] == ["7/2", "-7/2"]
+    with pytest.raises(ValueError):
+        np.asarray(x, copy=False)
+
+
+# sorting and factorizing
+# -----------------------
+
+
+def test_sort_exact():
+    # distinct fractions that are equal as floats
+    big = 2**60
+    xs = [F(big + 1, big), F(1), F(big - 1, big), F(big + 1, big), F(-1, 2)]
+    assert float(xs[0]) == float(xs[1]) == float(xs[2])
+    s = pd.Series(xs, dtype="frac")
+    assert s.sort_values().tolist() == sorted(xs)
+    assert s.argmax() == 0 and s.argmin() == 4
+    assert s.rank().tolist() == [4.5, 3.0, 2.0, 4.5, 1.0]
+
+
+def test_sort_matches_python():
+    rng = np.random.default_rng(4)
+    xs = random_fractions(rng, 200, max_den=10)  # with many duplicates
+    s = pd.Series(xs + [None], dtype="frac")
+    assert s.sort_values().tolist()[:-1] == sorted(xs)
+    assert pd.isna(s.sort_values().iloc[-1])
+    assert s.sort_values(ascending=False).tolist()[:-1] == sorted(xs, reverse=True)
+
+
+def test_factorize():
+    s = pd.Series([F(1, 2), F(3, 2), None, F(1, 2), F(-1, 3), None], dtype="frac")
+    codes, uniques = s.factorize()
+    assert codes.tolist() == [0, 1, -1, 0, 2, -1]
+    assert uniques.tolist() == [F(1, 2), F(3, 2), F(-1, 3)]
+    codes, uniques = s.factorize(use_na_sentinel=False)
+    assert codes.tolist() == [0, 1, 2, 0, 3, 2]
+    assert uniques.isna().tolist() == [False, False, True, False]
+    assert pd.Series([], dtype="frac").factorize()[0].tolist() == []
+
+
+def test_factorize_based_methods():
+    s = pd.Series([F(1, 2), F(3, 2), None, F(1, 2)], dtype="frac")
+    assert s.value_counts().to_dict() == {F(1, 2): 2, F(3, 2): 1}
+    assert s.duplicated().tolist() == [False, False, False, True]
+    df = pd.DataFrame({"k": s, "v": [1, 2, 3, 4]})
+    assert df.groupby("k")["v"].sum().to_dict() == {F(1, 2): 5, F(3, 2): 2}

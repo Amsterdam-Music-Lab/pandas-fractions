@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 import fractions as fr
 from pandas._typing import type_t
+from pandas.api.extensions import no_default
 from pandas.core import arraylike, roperator
 
 
@@ -21,6 +22,13 @@ class FractionDType(pd.api.extensions.ExtensionDtype):
 
     def construct_array_type(self) -> type_t["FractionArray"]:
         return FractionArray
+
+    def _get_common_dtype(self, dtypes):
+        # fractions represent all integers exactly, so they absorb integer dtypes
+        # (e.g. when concatenating), but not floats or anything else
+        if all(isinstance(t, FractionDType) or t.kind in "iu" for t in dtypes):
+            return self
+        return None
 
 
 def _to_parts(value) -> tuple[int, int]:
@@ -120,6 +128,23 @@ def _compare(op, a, b, c, d):
         # compare exactly with Python ints
         obj = lambda x: np.asarray(x).astype(object)
         return np.asarray(op(obj(a) * obj(d), obj(c) * obj(b)), dtype=bool)
+
+
+def _exact_order(num, den):
+    """Return the indices that sort the fractions num/den exactly (stable)."""
+    # Integers up to 2^53 are exact floats, and then num / den is correctly rounded,
+    # so sorting by float gives the right order, except between distinct fractions
+    # that round to the same float. These would be adjacent after sorting.
+    limit = 2**53
+    if np.all((num >= -limit) & (num <= limit) & (den <= limit)):
+        floats = num / den
+        order = np.argsort(floats, kind="stable")
+        f, n, d = floats[order], num[order], den[order]
+        if not np.any((f[1:] == f[:-1]) & ((n[1:] != n[:-1]) | (d[1:] != d[:-1]))):
+            return order
+    # otherwise sort exactly with Python's Fraction
+    key = lambda i: fr.Fraction(int(num[i]), int(den[i]))
+    return np.array(sorted(range(len(num)), key=key), dtype=np.intp)
 
 
 def _min(a, b, c, d):
@@ -297,8 +322,37 @@ class FractionArray(arraylike.OpsMixin, pd.api.extensions.ExtensionArray):
         return cls(num, den)
 
     @classmethod
+    def _from_scalars(cls, scalars, *, dtype):
+        # Strict version of _from_sequence, used by pandas to decide whether the results
+        # of a pointwise operation (e.g. Series.combine) still have this dtype.
+        # Only fractions, integers, and NA qualify, so that e.g. bools and floats don't.
+        for x in scalars:
+            exact = isinstance(x, (fr.Fraction, int, np.integer))
+            if isinstance(x, (bool, np.bool_)) or not (exact or pd.isna(x)):
+                raise TypeError(f"{type(x).__name__} is not a valid {dtype}")
+        return cls._from_sequence(scalars, dtype=dtype)
+
+    @classmethod
+    def _from_sequence_of_strings(cls, strings, *, dtype, copy=False):
+        # Fraction parses strings like "3", "-1/2", or "0.25"; empty strings are NA
+        return cls._from_sequence(
+            [None if isinstance(s, str) and not s.strip() else s for s in strings]
+        )
+
+    @classmethod
     def _from_factorized(cls, values, original):
         return cls._from_sequence(values)
+
+    @property
+    def _readonly(self) -> bool:
+        # stored as the writeable flag of the numpy arrays,
+        # so that views (e.g. slices) of read-only arrays are read-only as well
+        return not self._num.flags.writeable
+
+    @_readonly.setter
+    def _readonly(self, value: bool):
+        self._num.flags.writeable = not value
+        self._den.flags.writeable = not value
 
     def __getitem__(self, item):
         if pd.api.types.is_integer(item):
@@ -310,6 +364,8 @@ class FractionArray(arraylike.OpsMixin, pd.api.extensions.ExtensionArray):
         return type(self)(self._num[item], self._den[item])
 
     def __setitem__(self, key, value):
+        if self._readonly:
+            raise ValueError("Cannot modify read-only array")
         key = pd.api.indexers.check_array_indexer(self, key)
         if pd.api.types.is_scalar(value):
             num, den = _to_parts(value)
@@ -356,6 +412,96 @@ class FractionArray(arraylike.OpsMixin, pd.api.extensions.ExtensionArray):
             np.concatenate([a._num for a in to_concat]),
             np.concatenate([a._den for a in to_concat]),
         )
+
+    # conversion
+    # ----------
+
+    def to_numpy(self, dtype=None, copy=False, na_value=no_default):
+        # the conversion always creates a new array, so `copy` doesn't matter
+        dtype = np.dtype(object if dtype is None else dtype)
+        na = self.isna()
+        if dtype.kind == "f":
+            result = self._to_float().astype(dtype, copy=False)
+        else:
+            result = np.empty(len(self), dtype=object)
+            valid = ~na
+            result[valid] = [
+                fr.Fraction(int(a), int(b))
+                for a, b in zip(self._num[valid], self._den[valid])
+            ]
+            result[na] = self.dtype.na_value
+        if na_value is not no_default:
+            result[na] = na_value
+        return result.astype(dtype, copy=False)
+
+    def __array__(self, dtype=None, copy=None):
+        if copy is False:
+            raise ValueError(
+                "A FractionArray can't be converted to numpy without a copy"
+            )
+        return self.to_numpy(dtype=dtype)
+
+    def astype(self, dtype, copy=True):
+        dtype = pd.api.types.pandas_dtype(dtype)
+        if isinstance(dtype, FractionDType):
+            return self.copy() if copy else self
+        if isinstance(dtype, np.dtype) and dtype.kind in "fO":
+            return self.to_numpy(dtype=dtype)
+        if isinstance(dtype, np.dtype) and dtype.kind in "iu":
+            if self.isna().any():
+                raise ValueError("Cannot convert NA to integer")
+            # truncate towards zero, like int(Fraction)
+            return _trunc(self._num, self._den)[0].astype(dtype)
+        return super().astype(dtype, copy=copy)
+
+    # sorting and factorizing
+    # -----------------------
+
+    def _values_for_argsort(self) -> np.ndarray:
+        """
+        Return integer ranks that sort exactly like the fractions.
+
+        Equal fractions get equal ranks, missing values the highest rank.
+        """
+        na = self.isna()
+        num, den = self._num[~na], self._den[~na]
+        order = _exact_order(num, den)
+        # normalized fractions are equal iff their parts are equal
+        n, d = num[order], den[order]
+        new_value = np.ones(len(order), dtype=bool)
+        new_value[1:] = (n[1:] != n[:-1]) | (d[1:] != d[:-1])
+        valid_ranks = np.empty(len(order), dtype=np.int64)
+        valid_ranks[order] = np.cumsum(new_value) - 1
+        ranks = np.full(len(self), len(order), dtype=np.int64)
+        ranks[~na] = valid_ranks
+        return ranks
+
+    def factorize(self, use_na_sentinel=True):
+        # normalized fractions are equal iff their parts are equal,
+        # so the unique values are the unique (numerator, denominator) rows
+        pairs = np.stack([self._num, self._den], axis=1)
+        if len(pairs) == 0:
+            return np.array([], dtype=np.intp), self.copy()
+        uniques, first, inverse = np.unique(
+            pairs, axis=0, return_index=True, return_inverse=True
+        )
+        # like pandas, number the unique values in order of their first appearance
+        order = np.argsort(first)
+        codes = np.empty(len(order), dtype=np.intp)
+        codes[order] = np.arange(len(order))
+        codes = codes[inverse.reshape(-1)]
+        uniques = uniques[order]
+
+        na = self.isna()
+        if use_na_sentinel and na.any():
+            na_code = codes[np.argmax(na)]
+            codes = np.where(na, -1, codes - (codes > na_code))
+            uniques = np.delete(uniques, na_code, axis=0)
+        return codes, type(self)(uniques[:, 0], uniques[:, 1])
+
+    def unique(self):
+        # in order of appearance, including NA, like pandas' unique
+        return self.factorize(use_na_sentinel=False)[1]
 
     # arithmetic and comparison
     # -------------------------
@@ -441,8 +587,12 @@ class FractionArray(arraylike.OpsMixin, pd.api.extensions.ExtensionArray):
         results = [
             None if pd.isna(x) or pd.isna(y) else op(x, y) for x, y in zip(self, other)
         ]
-        if any(isinstance(r, float) for r in results):
-            return np.array([np.nan if r is None else r for r in results], dtype=float)
+        # e.g. roots are floats, and roots of negative numbers are complex
+        for kind in (complex, float):
+            if any(isinstance(r, kind) for r in results):
+                return np.array(
+                    [np.nan if r is None else r for r in results], dtype=kind
+                )
         return type(self)._from_sequence(results)
 
     def _cmp_method(self, other, op):
@@ -480,7 +630,9 @@ class FractionArray(arraylike.OpsMixin, pd.api.extensions.ExtensionArray):
         result = self._reduce_scalar(name, skipna=skipna, **kwargs)
         if not keepdims:
             return result
-        if isinstance(result, (bool, np.bool_, float)):
+        # decide by name, not by result, since a missing fraction (NaN) is a float
+        if name in ("std", "sem", "any", "all"):
+            # a numpy array, so that e.g. df.std() has dtype float64
             return np.array([result])
         return type(self)._from_sequence([result])
 
