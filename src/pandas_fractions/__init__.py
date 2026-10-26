@@ -4,8 +4,7 @@ import numpy as np
 import pandas as pd
 import fractions as fr
 from pandas._typing import type_t
-from pandas.core import roperator
-from pandas.core.arraylike import OpsMixin
+from pandas.core import arraylike, roperator
 
 
 @pd.api.extensions.register_extension_dtype
@@ -175,6 +174,77 @@ def _scan(f, num, den):
     return num, den
 
 
+# exact unary ufuncs on parts
+# ---------------------------
+# Like the binary operations, these expect normalized inputs without NA.
+
+
+def _floor(num, den):
+    return num // den, np.ones_like(num)
+
+
+def _ceil(num, den):
+    return _checked_neg(_checked_neg(num) // den), np.ones_like(num)
+
+
+def _trunc(num, den):
+    return np.where(num < 0, _ceil(num, den)[0], num // den), np.ones_like(num)
+
+
+def _rint(num, den):
+    # round half to even, like np.rint and Python's round()
+    q, r = np.divmod(num, den)
+    _overflow_if(r > np.iinfo(np.int64).max // 2)
+    twice = 2 * r
+    up = (twice > den) | ((twice == den) & (q % 2 == 1))
+    return q + up, np.ones_like(num)
+
+
+def _sign(num, den):
+    return np.sign(num), np.ones_like(num)
+
+
+def _square(num, den):
+    return _mul(num, den, num, den)
+
+
+def _reciprocal(num, den):
+    return _truediv(np.ones_like(num), np.ones_like(num), num, den)
+
+
+_UNARY_UFUNCS = {
+    "floor": _floor,
+    "ceil": _ceil,
+    "trunc": _trunc,
+    "rint": _rint,
+    "sign": _sign,
+    "square": _square,
+    "reciprocal": _reciprocal,
+}
+
+# binary ufuncs: (operation, whether NA is skipped instead of propagated)
+_BINARY_UFUNCS = {
+    "minimum": (_min, False),
+    "maximum": (_max, False),
+    "fmin": (_min, True),
+    "fmax": (_max, True),
+}
+
+# ufunc methods that map to reductions and accumulations
+_UFUNC_REDUCTIONS = {
+    "add": "sum",
+    "multiply": "prod",
+    "minimum": "min",
+    "maximum": "max",
+}
+_UFUNC_ACCUMULATIONS = {
+    "add": "cumsum",
+    "multiply": "cumprod",
+    "minimum": "cummin",
+    "maximum": "cummax",
+}
+
+
 _ARITH_OPS = {
     operator.add: _add,
     operator.sub: _sub,
@@ -196,7 +266,7 @@ _REVERSED_OPS = {
 }
 
 
-class FractionArray(OpsMixin, pd.api.extensions.ExtensionArray):
+class FractionArray(arraylike.OpsMixin, pd.api.extensions.ExtensionArray):
     """
     An array of fractions, stored as two int64 arrays for numerators and denominators.
 
@@ -487,6 +557,78 @@ class FractionArray(OpsMixin, pd.api.extensions.ExtensionArray):
         num = np.where(na, neutral[0], self._num)
         den = np.where(na, neutral[1], self._den)
         return self._with_na(_scan(f, num, den), na)
+
+    # numpy ufuncs
+    # ------------
+
+    def __array_ufunc__(self, ufunc, method, *inputs, **kwargs):
+        # defer to pandas containers, which unwrap themselves and call this again
+        out = kwargs.get("out", ())
+        if any(
+            isinstance(x, (pd.Series, pd.Index, pd.DataFrame)) for x in inputs + out
+        ):
+            return NotImplemented
+
+        # operators: np.add(x, y) -> x + y, np.negative(x) -> -x, etc.
+        result = arraylike.maybe_dispatch_ufunc_to_dunder_op(
+            self, ufunc, method, *inputs, **kwargs
+        )
+        if result is not NotImplemented:
+            return result
+
+        kwargs = arraylike._standardize_out_kwarg(**kwargs)
+        if "out" in kwargs:
+            # compute without out, then copy the result into out
+            return arraylike.dispatch_ufunc_with_out(
+                self, ufunc, method, *inputs, **kwargs
+            )
+
+        name = ufunc.__name__
+        single = len(inputs) == 1 and inputs[0] is self
+        # like numpy, ufunc methods don't skip NA
+        if method == "reduce" and single and name in _UFUNC_REDUCTIONS:
+            if kwargs.get("axis", 0) in (0, None) and not kwargs.get("keepdims"):
+                return self._reduce(_UFUNC_REDUCTIONS[name], skipna=False)
+        if method == "accumulate" and single and name in _UFUNC_ACCUMULATIONS:
+            if kwargs.get("axis", 0) == 0:
+                return self._accumulate(_UFUNC_ACCUMULATIONS[name], skipna=False)
+
+        if method == "__call__" and not kwargs:
+            if single and name in _UNARY_UFUNCS:
+                na = self.isna()
+                num, den = np.where(na, 1, self._num), np.where(na, 1, self._den)
+                return self._with_na(_UNARY_UFUNCS[name](num, den), na)
+            if len(inputs) == 2 and name in _BINARY_UFUNCS:
+                result = self._binary_ufunc(name, *inputs)
+                if result is not NotImplemented:
+                    return result
+
+        # fallback: compute with floats, e.g. np.sqrt or np.exp
+        float_inputs = [
+            x._to_float() if isinstance(x, FractionArray) else x for x in inputs
+        ]
+        return getattr(ufunc, method)(*float_inputs, **kwargs)
+
+    def _binary_ufunc(self, name, left, right):
+        """Exact elementwise minimum and maximum."""
+        parts = []
+        for x in (left, right):
+            if x is self:
+                parts.append((self._num, self._den))
+            else:
+                coerced = self._coerce_other(x)
+                if not isinstance(coerced, tuple):  # float or unsupported operand
+                    return NotImplemented
+                parts.append(coerced)
+        (a, b), (c, d) = parts
+        f, skip_na = _BINARY_UFUNCS[name]
+        na_left, na_right = b == 0, d == 0
+        na = (na_left & na_right) if skip_na else (na_left | na_right)
+        # replace a missing operand by the other one (only matters for fmin/fmax)
+        a, b = np.where(na_left, c, a), np.where(na_left, d, b)
+        c, d = np.where(na_right, a, c), np.where(na_right, b, d)
+        a, b, c, d = (np.where(na, 1, x) for x in (a, b, c, d))
+        return self._with_na(f(a, b, c, d), na)
 
 
 def _part_to_scalar(num, den):

@@ -380,3 +380,80 @@ def test_accumulate_dataframe():
     result = df.cumsum()
     assert result["a"].dtype == "frac"
     assert result["a"].tolist() == [F(1, 2), F(5, 6)]
+
+
+# numpy ufuncs
+# ------------
+
+
+@pytest.fixture
+def x():
+    return FractionArray._from_sequence([F(7, 2), F(-5, 2), F(5, 2), F(-1, 3), None])
+
+
+def test_ufunc_operators(x):
+    assert np.add(x, 1).tolist()[:4] == [F(9, 2), F(-3, 2), F(7, 2), F(2, 3)]
+    assert np.subtract(1, x).tolist()[:4] == [F(-5, 2), F(7, 2), F(-3, 2), F(4, 3)]
+    assert np.true_divide(x, 2).dtype == "frac"
+    assert np.less(x, 0).tolist() == [False, True, False, True, False]
+    assert np.negative(x).tolist()[:4] == [F(-7, 2), F(5, 2), F(-5, 2), F(1, 3)]
+    assert np.absolute(x).tolist()[:4] == [F(7, 2), F(5, 2), F(5, 2), F(1, 3)]
+
+
+@pytest.mark.parametrize("ufunc", [np.floor, np.ceil, np.trunc, np.rint, np.sign])
+def test_ufunc_rounding_matches_numpy(ufunc):
+    rng = np.random.default_rng(3)
+    xs = random_fractions(rng, 200, max_den=8) + [F(1, 2), F(-1, 2), F(3, 2), F(-3, 2)]
+    result = ufunc(FractionArray._from_sequence(xs))
+    assert result.dtype == "frac"
+    assert result.tolist() == ufunc(np.array([float(v) for v in xs])).tolist()
+
+
+def test_ufunc_square_reciprocal(x):
+    assert np.square(x).tolist()[:4] == [F(49, 4), F(25, 4), F(25, 4), F(1, 9)]
+    assert np.reciprocal(x).tolist()[:4] == [F(2, 7), F(-2, 5), F(2, 5), F(-3)]
+    assert np.isnan(np.square(x).astype(float))[4]
+    with pytest.raises(ZeroDivisionError):
+        np.reciprocal(FractionArray._from_sequence([0]))
+
+
+def test_ufunc_minimum_maximum(x):
+    y = FractionArray._from_sequence([1, F(-3), None, F(-1, 2), 2])
+    assert np.minimum(x, y).tolist()[:2] == [F(1), F(-3)]
+    assert np.minimum(x, y).isna().tolist() == [False, False, True, False, True]
+    assert np.fmin(x, y).tolist() == [F(1), F(-3), F(5, 2), F(-1, 2), F(2)]
+    assert np.fmax(x, y).tolist() == [F(7, 2), F(-5, 2), F(5, 2), F(-1, 3), F(2)]
+    assert np.maximum(0, x).tolist()[:4] == [F(7, 2), F(0), F(5, 2), F(0)]
+    # float operands fall back to floats
+    assert np.maximum(x, 0.5).dtype == np.float64
+
+
+def test_ufunc_reduce_accumulate(x):
+    valid = x[:4]
+    assert np.add.reduce(valid) == F(19, 6)
+    assert np.multiply.reduce(valid) == F(175, 24)
+    assert np.minimum.reduce(valid) == F(-5, 2)
+    assert np.maximum.reduce(valid) == F(7, 2)
+    # like numpy with NaN, NA is not skipped
+    assert pd.isna(np.add.reduce(x))
+    assert np.add.accumulate(valid).tolist() == [F(7, 2), F(1), F(7, 2), F(19, 6)]
+    assert np.add.accumulate(x).isna().tolist() == [False] * 4 + [True]
+
+
+def test_ufunc_float_fallback(x):
+    result = np.sqrt(abs(x))
+    assert result.dtype == np.float64
+    np.testing.assert_allclose(result[:4], np.sqrt([3.5, 2.5, 2.5, 1 / 3]))
+    assert np.isnan(result[4])
+    assert np.isnan(x).tolist() == [False] * 4 + [True]
+    out = np.empty(5)
+    np.exp(x, out=out)
+    np.testing.assert_allclose(out[:4], np.exp([3.5, -2.5, 2.5, -1 / 3]))
+
+
+def test_ufunc_series(x):
+    s = pd.Series(x)
+    assert isinstance(np.floor(s), pd.Series)
+    assert np.floor(s).dtype == "frac"
+    assert np.add(s, s).dtype == "frac"
+    assert np.sqrt(abs(s)).dtype == np.float64

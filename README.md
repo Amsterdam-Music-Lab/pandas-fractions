@@ -306,6 +306,58 @@ Missing values follow the semantics of pandas' float accumulations:
   The filled positions are set back to missing afterwards.
 - With `skipna=False`, every position from the first missing value on is missing.
 
+## NumPy ufuncs
+
+`__array_ufunc__` makes numpy's ufuncs (like `np.add` or `np.floor`) work on `FractionArray`s,
+and through pandas also on `Series` with the `frac` dtype.
+Without it, numpy would convert the array to an `object` array of `Fraction`s.
+The general rule is: if a ufunc has an exact counterpart for fractions, it is used,
+otherwise the ufunc is computed with floats.
+
+`__array_ufunc__` tries the following steps in order:
+
+1. **pandas containers.**
+   If any input or output is a `Series`, `Index`, or `DataFrame`, it returns `NotImplemented`.
+   pandas then unwraps the container, calls the ufunc on the underlying arrays, and wraps the result again.
+2. **Operators.**
+   Ufuncs that correspond to an operator are forwarded to it using pandas'
+   `maybe_dispatch_ufunc_to_dunder_op`, e.g. `np.add(x, y)` to `x + y`,
+   `np.less(x, y)` to `x < y`, or `np.negative(x)` to `-x`.
+   They behave exactly like the operators, including overflow checks and missing values.
+3. **`out` argument.**
+   If an `out` argument is given, the ufunc is computed without it,
+   and the result is copied into `out` (pandas' `dispatch_ufunc_with_out`).
+   Since `FractionArray` doesn't support item assignment yet,
+   `out` must be a numpy array, so this only works for ufuncs with float or boolean results.
+4. **Reductions and accumulations.**
+   `reduce` and `accumulate` of `add`, `multiply`, `minimum`, and `maximum`
+   are forwarded to `_reduce` (`sum`, `prod`, `min`, `max`)
+   and `_accumulate` (`cumsum`, `cumprod`, `cummin`, `cummax`),
+   e.g. `np.add.reduce(x)` is `x.sum()`.
+   Like numpy's ufunc methods on floats, they don't skip missing values (`skipna=False`).
+5. **Exact unary ufuncs**, computed on the numerators and denominators:
+   - `floor`, `ceil`, `trunc`, and `rint` return integral fractions
+     (numpy returns floats for float inputs).
+     `rint` rounds halves to even, like numpy and Python's `round`.
+   - `sign` returns `-1`, `0`, or `1` as fractions.
+   - `square` multiplies the array with itself, and `reciprocal` computes `1 / x`.
+     Like division, `reciprocal` raises a `ZeroDivisionError` for zero
+     (numpy returns infinity for floats).
+6. **Exact elementwise minimum and maximum.**
+   `minimum` and `maximum` propagate missing values, like numpy does with `NaN`,
+   while `fmin` and `fmax` return the other value if only one of them is missing.
+   They use the same exact comparison as the comparison operators.
+   Float operands use the float fallback instead.
+7. **Float fallback.**
+   All other ufuncs and methods (e.g. `np.sqrt`, `np.exp`, `np.isnan`)
+   convert every `FractionArray` input to floats (with missing values as `NaN`)
+   and return numpy's result for these floats.
+   Most of these functions produce irrational results anyway,
+   so an exact implementation would not be possible.
+
+Missing values in the exact unary ufuncs are handled like in arithmetic:
+they are replaced by `1/1` for the computation and set back to missing in the result.
+
 ## Not yet implemented
 
-- numpy ufuncs (via `__array_ufunc__`), e.g. `np.add(x, y)`.
+- Item assignment (`__setitem__`), e.g. `x[0] = Fraction(1, 2)` or `np.floor(x, out=x)`.
