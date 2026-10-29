@@ -1,10 +1,12 @@
 import operator
+from functools import partial
 
 import numpy as np
 import pandas as pd
 import fractions as fr
 from pandas._typing import type_t
 from pandas.api.extensions import no_default
+from pandas.compat.numpy import function as nv
 from pandas.core import arraylike, roperator
 
 
@@ -744,6 +746,58 @@ class FractionArray(arraylike.OpsMixin, pd.api.extensions.ExtensionArray):
     def _mean_parts(num, den):
         sum_num, sum_den = _tree_reduce(_add, num, den, (0, 1))
         return _truediv(sum_num, sum_den, np.array([len(num)]), 1)
+
+    # Reduction methods, e.g. arr.sum(), computed like _reduce.
+    # numpy functions like np.sum(arr) call them as well, with numpy's arguments
+    # (axis, out, dtype, ...), which are checked like in pandas' own arrays.
+
+    def _reduction(self, name, validate, axis, kwargs, **params):
+        validate((), kwargs)
+        if axis not in (None, 0):
+            raise ValueError(f"axis {axis} is out of bounds for a 1D array")
+        return self._reduce_scalar(name, **params)
+
+    def sum(self, *, skipna=True, min_count=0, axis=None, **kwargs):
+        return self._reduction(
+            "sum", nv.validate_sum, axis, kwargs, skipna=skipna, min_count=min_count
+        )
+
+    def prod(self, *, skipna=True, min_count=0, axis=None, **kwargs):
+        return self._reduction(
+            "prod", nv.validate_prod, axis, kwargs, skipna=skipna, min_count=min_count
+        )
+
+    def min(self, *, skipna=True, axis=None, **kwargs):
+        return self._reduction("min", nv.validate_min, axis, kwargs, skipna=skipna)
+
+    def max(self, *, skipna=True, axis=None, **kwargs):
+        return self._reduction("max", nv.validate_max, axis, kwargs, skipna=skipna)
+
+    def mean(self, *, skipna=True, axis=None, **kwargs):
+        return self._reduction("mean", nv.validate_mean, axis, kwargs, skipna=skipna)
+
+    def median(self, *, skipna=True, axis=None, **kwargs):
+        return self._reduction(
+            "median", nv.validate_median, axis, kwargs, skipna=skipna
+        )
+
+    def var(self, *, skipna=True, ddof=1, axis=None, **kwargs):
+        validate = partial(nv.validate_stat_ddof_func, fname="var")
+        return self._reduction("var", validate, axis, kwargs, skipna=skipna, ddof=ddof)
+
+    def std(self, *, skipna=True, ddof=1, axis=None, **kwargs):
+        validate = partial(nv.validate_stat_ddof_func, fname="std")
+        return self._reduction("std", validate, axis, kwargs, skipna=skipna, ddof=ddof)
+
+    def sem(self, *, skipna=True, ddof=1, axis=None, **kwargs):
+        validate = partial(nv.validate_stat_ddof_func, fname="sem")
+        return self._reduction("sem", validate, axis, kwargs, skipna=skipna, ddof=ddof)
+
+    def any(self, *, skipna=True, axis=None, **kwargs):
+        return self._reduction("any", nv.validate_any, axis, kwargs, skipna=skipna)
+
+    def all(self, *, skipna=True, axis=None, **kwargs):
+        return self._reduction("all", nv.validate_all, axis, kwargs, skipna=skipna)
 
     # accumulations
     # -------------

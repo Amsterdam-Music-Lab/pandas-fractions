@@ -256,6 +256,16 @@ pandas' extension test suite expects an extension array here even for float resu
 but wrapping the result as a `NumpyExtensionArray` would give `df.std()` the unusual dtype
 `NumpyEADtype('float64')`, so these checks are marked as expected failures (see [Testing](#testing)).
 
+The array also has reduction methods like `x.sum()`, `x.max()`, or `x.std(ddof=0)`,
+which pandas is moving towards (pandas' base `_reduce` already dispatches to them).
+They take the same arguments as `_reduce` and compute the scalar with `_reduce_scalar`,
+for all supported reductions: `sum`, `prod`, `min`, `max`, `mean`, `median`,
+`var`, `std`, `sem`, `any`, and `all` (`count` is inherited from `ExtensionArray`).
+numpy functions like `np.sum(x)` or `np.std(x)` call these methods with numpy's arguments
+(`axis`, `out`, `dtype`, ...), which are validated with pandas' own validators,
+so like for pandas' nullable arrays, they skip missing values and use numpy's defaults
+(e.g. `ddof=0` for `np.std`).
+
 ### Result types
 
 Reductions whose result is always rational return an exact `Fraction`:
@@ -363,8 +373,9 @@ otherwise the ufunc is computed with floats.
    `reduce` and `accumulate` of `add`, `multiply`, `minimum`, and `maximum`
    are forwarded to `_reduce` (`sum`, `prod`, `min`, `max`)
    and `_accumulate` (`cumsum`, `cumprod`, `cummin`, `cummax`),
-   e.g. `np.add.reduce(x)` is `x.sum()`.
-   Like numpy's ufunc methods on floats, they don't skip missing values (`skipna=False`).
+   e.g. `np.add.reduce(x)` is `x.sum(skipna=False)`.
+   Like numpy's ufunc methods on floats, they don't skip missing values.
+   (In contrast, numpy functions like `np.sum(x)` call the reduction methods, see below.)
 5. **Exact unary ufuncs**, computed on the numerators and denominators:
    - `floor`, `ceil`, `trunc`, and `rint` return integral fractions
      (numpy returns floats for float inputs).

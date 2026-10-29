@@ -313,6 +313,48 @@ def test_reduce_unsupported(s):
         s.skew()
 
 
+@pytest.mark.parametrize(
+    "name, kwargs",
+    [
+        ("sum", {}),
+        ("sum", {"skipna": False}),
+        ("sum", {"min_count": 5}),
+        ("prod", {"min_count": 2}),
+        ("min", {}),
+        ("max", {"skipna": False}),
+        ("mean", {}),
+        ("median", {}),
+        ("var", {"ddof": 0}),
+        ("std", {}),
+        ("sem", {"ddof": 0}),
+        ("any", {}),
+        ("all", {"skipna": False}),
+    ],
+)
+def test_reduction_methods(s, name, kwargs):
+    # the array's methods compute the same as the reductions of the Series
+    result = getattr(s.array, name)(**kwargs)
+    expected = s.array._reduce(name, **kwargs)
+    assert (pd.isna(result) and pd.isna(expected)) or result == expected
+
+
+def test_reduction_numpy_functions(s):
+    # numpy functions call the methods, so they skip NA like pandas
+    arr = s.array
+    assert np.sum(arr) == F(49, 12)
+    assert np.max(arr) == F(3)
+    assert np.mean(arr) == F(49, 48)
+    # numpy's default ddof is 0
+    assert np.std(arr) == pytest.approx(float(arr.var(ddof=0)) ** 0.5)
+    # ufunc reductions don't skip NA
+    assert pd.isna(np.add.reduce(arr))
+    with pytest.raises(ValueError):
+        arr.sum(axis=1)
+    with pytest.raises(ValueError):
+        np.sum(arr, keepdims=True)
+    assert not hasattr(arr, "kurt")
+
+
 def test_dataframe_reductions(s):
     df = pd.DataFrame({"a": s, "b": s * 2})
     result = df.sum()
